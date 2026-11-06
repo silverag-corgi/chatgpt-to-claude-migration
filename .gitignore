@@ -218,3 +218,14 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Conversation history
+input
+output
+
+# Local OCR runtime, downloaded models, and private trial outputs
+.ocr-tools/
+.venv-ocr/
+.venv-easyocr/
+.venv-ndlocr/
+.ocr-cache/
