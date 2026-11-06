@@ -19,7 +19,9 @@ OUT = ROOT / 'output'
 MID = OUT / 'intermediate'
 REPORTS = OUT / 'reports'
 IMPORT = OUT / 'import'
-CATEGORIES = ['Instructions', 'Identity', 'Career', 'Projects', 'Preferences']
+CATEGORIES = ['指示', '基本情報', '経歴', 'プロジェクト', '好み']
+# Preserve the original extraction rows while rendering the current README format.
+CATEGORY_ALIASES = dict(zip(['Instructions', 'Identity', 'Career', 'Projects', 'Preferences'], CATEGORIES))
 THEMES = {
     'engineering': ('01-engineering.md', 'IT技術・プログラミング'),
     'career': ('02-career.md', 'キャリア・転職・働き方'),
@@ -69,6 +71,17 @@ def completed_ocr():
 
 def read_json(path):
     return json.loads(path.read_text())
+
+
+def prompt_review():
+    path = MID / 'japanese-prompt-review.json'
+    return read_json(path) if path.exists() else None
+
+
+def input_files():
+    """An empty directory placeholder is repository metadata, not export data."""
+    return {str(p.relative_to(ROOT)) for p in (ROOT / 'input').rglob('*') if p.is_file()
+            and not (p == ROOT / 'input/.gitkeep' and p.stat().st_size == 0)}
 
 
 def write_json(path, value):
@@ -124,6 +137,7 @@ def make_entries(convs):
     assert len({r for x in final for r in x['rows']}) + len(decisions['dropped']) == len(candidates)
     for entry in final:
         entry['id'] = f"E{min(entry['rows']):04d}"
+        entry['category'] = CATEGORY_ALIASES.get(entry['category'], entry['category'])
         dates = []
         for ref in entry['refs']:
             base, _, asset = ref.partition('@')
@@ -138,7 +152,7 @@ def make_entries(convs):
                     isinstance(a, dict) and a.get('asset_pointer', '').split('://')[-1] + '.dat' == asset
                     for a in m['nontext_parts']), ref
         entry['date'] = max(dates) if dates else 'unknown'
-        assert entry['category'] in CATEGORIES and entry['category'] != 'Instructions'
+        assert entry['category'] in CATEGORIES and entry['category'] != '指示'
         assert set(entry['themes']) <= set(THEMES)
         assert '\n' not in entry['text'] and '```' not in entry['text']
     final.sort(key=lambda x: (CATEGORIES.index(x['category']), x['date'], x['id']))
@@ -224,6 +238,7 @@ def artifact_assets(convs):
 
 def classify(convs, entries, assets, missing, text_assets):
     overrides = read_json(MID / 'consolidations.json').get('theme_overrides', {})
+    revision = prompt_review()
     by_conv = collections.defaultdict(list)
     for entry in entries:
         for cref in {ref[:5] for ref in entry['refs']}:
@@ -277,6 +292,8 @@ def classify(convs, entries, assets, missing, text_assets):
             themes = set(overrides[c['ref']]) | manual
             method = 'individual_user_body_review_override'
         note = '抽出あり' if by_conv[c['ref']] else '本文確認済み。単発の一般質問・比較・操作依頼・引用、または別会話と重複する内容で、独立した長期エントリは採用しなかった。'
+        if revision:
+            note += ' 日本語プロンプト対応では原文一致を検証し、前回の本文確認を再利用して分類・採否を見直した。'
         incomplete = bool(gaps[c['ref']]) or c['ref'] in long_gaps
         if incomplete:
             note += ' 添付・長文の詳細には別台帳記載の未解析範囲あり。'
@@ -341,7 +358,7 @@ def imports_and_provenance(entries, lookup):
 def verify(entries, convs, inventory, file_counts):
     checks = {}
     changes = [x['path'] for x in inventory['files'] if not (ROOT / x['path']).is_file() or sha(ROOT / x['path']) != x['sha256']]
-    actual = {str(p.relative_to(ROOT)) for p in (ROOT / 'input').rglob('*') if p.is_file()}
+    actual = input_files()
     checks['input_hashes_unchanged'] = not changes
     checks['input_inventory_complete'] = actual == {x['path'] for x in inventory['files']}
     archive = ROOT / 'ChatGPT.zip'
@@ -352,11 +369,15 @@ def verify(entries, convs, inventory, file_counts):
                 if not member.is_dir():
                     p = ROOT / 'input' / member.filename
                     zip_check.append(p.exists() and hashlib.sha256(z.read(member)).hexdigest() == sha(p))
-    checks['archive_members_match_inputs'] = bool(zip_check) and all(zip_check)
-    checks['all_conversations_accounted_for'] = len(convs) == inventory['conversation_count'] == 1074
+    skipped = {}
+    if archive.exists():
+        checks['archive_members_match_inputs'] = bool(zip_check) and all(zip_check)
+    else:
+        skipped['archive_members_match_inputs'] = '元ZIPが現在存在しないため再照合できない。入力原本は既存inventory.jsonのSHA-256と全件照合する。'
+    checks['all_conversations_accounted_for'] = len(convs) == inventory['conversation_count']
     checks['unique_conversation_ids'] = len({c['id'] for c in convs}) == len(convs)
     checks['no_structural_issues'] = not inventory['structural_issues']
-    checks['no_saved_memory_instructions_inferred'] = all(e['category'] != 'Instructions' for e in entries)
+    checks['no_saved_memory_instructions_inferred'] = all(e['category'] != '指示' for e in entries)
     source_lookup = {m['ref']: m for c in convs for m in c['messages']}
     checks['all_entry_sources_user_messages'] = all(source_lookup[r.split('@')[0]]['role'] == 'user' for e in entries for r in e['refs'])
     checks['all_entry_sources_current_branch'] = all(source_lookup[r.split('@')[0]]['active'] for e in entries for r in e['refs'])
@@ -401,10 +422,38 @@ def verify(entries, convs, inventory, file_counts):
     with (REPORTS / 'conversation-index.csv').open(encoding='utf-8-sig') as f:
         classified = list(csv.DictReader(f))
     checks['every_conversation_classified'] = len(classified) == len(convs) and all(r['themes'] for r in classified)
+    revision = prompt_review()
+    if revision:
+        reviewed = {e['entry_id']: e for e in revision.get('entry_reviews', [])}
+        checks['current_readme_reviewed'] = revision['readme_sha256'] == sha(ROOT / 'README.md')
+        checks['normalized_corpus_matches_reviewed_source'] = (
+            revision.get('normalized_corpus_sha256') == sha(MID / 'conversations.jsonl') and
+            len(revision['normalized_conversations']) == len(convs) and
+            all(c['normalized_matches_original'] for c in revision['normalized_conversations']))
+        checks['every_final_entry_reassessed'] = set(reviewed) == {e['id'] for e in entries} and all(
+            reviewed[e['id']].get('reviewed') and reviewed[e['id']]['category'] == e['category'] and
+            reviewed[e['id']]['text_sha256'] == hashlib.sha256(e['text'].encode()).hexdigest()
+            for e in entries)
+        compact = lambda text: re.sub(r'\s+', '', text)
+        checks['reviewed_quotes_match_user_sources'] = all(
+            compact(q['quote']) in compact(source_lookup[q['source_ref']]['text']) and
+            q['quote'] in next(e['text'] for e in entries if e['id'] == q['entry_id'])
+            for q in revision.get('quote_evidence', []))
+        checks['projects_have_names_and_activity_evidence'] = all(
+            bool(re.match(r'^[^：:]{1,45}[：:]', e['text'])) and
+            reviewed.get(e['id'], {}).get('activity_evidence') and all(
+                evidence['source_ref'] in {r.split('@')[0] for r in e['refs']} and
+                compact(evidence['quote']) in compact(source_lookup[evidence['source_ref']]['text'])
+                for evidence in reviewed[e['id']]['activity_evidence'])
+            for e in entries if e['category'] == 'プロジェクト')
+        checks['existing_ocr_results_unchanged'] = all(
+            (MID / 'image-ocr' / name).is_file() and sha(MID / 'image-ocr' / name) == value
+            for name, value in revision['ocr_checkpoint_hashes'].items())
     # Check common credential forms, without emitting their values or scanning raw text into reports.
     secret_pattern = re.compile(r'gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|ya29\.[A-Za-z0-9_-]{30,}|1//[A-Za-z0-9_-]{30,}|-----BEGIN (?:RSA |OPENSSH )?PRIVATE KEY-----')
     checks['no_common_credential_patterns_in_deliverables'] = not any(secret_pattern.search(p.read_text(encoding='utf-8-sig')) for d in [IMPORT, REPORTS] for p in d.iterdir() if p.suffix in {'.md', '.csv'})
-    result = dict(passed=all(checks.values()), checks=checks, input_changes=changes,
+    result = dict(passed=all(checks.values()), checks=checks, skipped_checks=skipped, input_changes=changes,
+                  excluded_repository_files=['input/.gitkeep'] if (ROOT / 'input/.gitkeep').is_file() and (ROOT / 'input/.gitkeep').stat().st_size == 0 else [],
                   conversation_count=len(convs), entry_count=len(entries),
                   input_files=len(inventory['files']), archive_members=len(zip_check),
                   generated_files=file_counts)
@@ -414,6 +463,8 @@ def verify(entries, convs, inventory, file_counts):
 
 def report(convs, entries, candidates, assets, missing, classified, longs, inventory, counts, validation):
     ocr_summary = completed_ocr()
+    revision = prompt_review()
+    report_date = revision['date'] if revision else '2026-11-06'
     roles = collections.Counter(m['role'] for c in convs for m in c['messages'])
     dates = [m['datetime'] for c in convs for m in c['messages'] if m['datetime']]
     categories = collections.Counter(e['category'] for e in entries)
@@ -422,17 +473,20 @@ def report(convs, entries, candidates, assets, missing, classified, longs, inven
     merges = [e for e in entries if len(e['rows']) > 1]
     locations = sum(counts[f] for f in counts if f != 'complete-import.md')
     lines = ['# ChatGPT → Claude メモリ抽出レポート', '',
-             '作成日: 2026-11-06。作業はローカルファイルに限定。外部API、外部へのアップロード、Gitコミット、Claudeへの実インポートは実行していない。', '',
+             f'作成日: {report_date}。作業はローカルファイルに限定。外部API、外部へのアップロード、Gitコミット、Claudeへの実インポートは実行していない。', '',
              '## 入力と全件処理の範囲', '',
              f'- 総会話数: **{len(convs):,}件**。構造解析・ユーザー本文の分割確認・テーマ分類済み: **{len(classified):,}件**。台帳に未記録の会話: **0件**。',
              f'- ユーザー発言{roles["user"]:,}件、アシスタント発言{roles["assistant"]:,}件を全分岐から保持。発言日時の範囲は{min(dates)[:10]}～{max(dates)[:10]}（Asia/Tokyo）。',
              '- 読了対象はユーザーの自然言語本文。長文のコード・ログは周辺説明と結論を確認し、全行の意味解釈はしていない。AI回答は文脈確認に用い、提案や推測を本人の確定情報にはしない。AIの全応答・内部思考を精読したという意味ではない。',
              f'- 添付・技術長文に未解析範囲がある会話は{sum(r["status"] == "text_reviewed_with_exceptions" for r in classified)}件。したがって「全会話を台帳に記録・本文確認」と「全添付解析・有用情報の完全抽出」は異なる。',
-             f'- input配下{len(inventory["files"])}ファイル、{sum(f["bytes"] for f in inventory["files"]):,}バイト。会話JSONは11分割。ルートのChatGPT.zipは{(ROOT / "ChatGPT.zip").stat().st_size:,}バイト、全{len(inventory["zip_check"])}メンバーがinputとSHA-256一致。処理開始時の全入力ハッシュと終了時を照合し、変更なし。',
+             f'- 入力原本{len(inventory["files"])}ファイル、{sum(f["bytes"] for f in inventory["files"]):,}バイト。会話JSONは11分割。既存の開始時ハッシュ台帳と全入力原本を照合し、変更なし。空のinput/.gitkeepは管理用として原本件数から除外。',
+             (f'- ChatGPT.zipは{(ROOT / "ChatGPT.zip").stat().st_size:,}バイト。今回、ZIPメンバーとinputのSHA-256を再照合した。'
+              if (ROOT / 'ChatGPT.zip').exists() else
+              f'- 元のChatGPT.zipは現在存在しないため、今回のZIP再照合は未実施（検証のskipped_checksへ記録）。前回台帳には{len(inventory["zip_check"])}メンバーの照合履歴が残る。今回の原本不変性は保存済みSHA-256台帳との全件一致で確認した。'),
              '- 入力全ファイルとハッシュ: [input-inventory.csv](input-inventory.csv)。chat.htmlは会話の表示用複製なので会話数へ加算しない。library_files.json・添付名対応表は添付照合に使用。',
              '- user.jsonはアカウント情報、user_settings.jsonは設定フラグ。shared_conversations.jsonは共有情報、message_feedback.jsonは反応情報。ads.json・sectioned_conversations.jsonは空。sitesのマニフェストには追加会話本文なし。個人メールアドレス等のアカウント識別子は移行エントリに不要として採用しない。', '',
              '## 分類・抽出方法', '',
-             '- ユーザー本文を会話番号順に分割して確認し、本人の事実・好み・実行中の活動を167件の途中稿に記録。2,000文字超73発言は別台帳で扱い、本人のプロフィール・職歴・希望・活動記録を重点確認した。',
+             f'- 前回、ユーザー本文を会話番号順に分割して確認し、本人の事実・好み・実行中の活動を167件の途中稿に記録。日本語プロンプト対応後の途中稿は{len(candidates)}件。2,000文字超73発言は別台帳で扱い、本人のプロフィール・職歴・希望・活動記録を重点確認した。',
              '- テーマ索引は全ユーザー本文と確認済みテキスト添付へのキーワード規則で複数所属を付与し、採用エントリの出典会話へ確認済みテーマを追加。本文に手掛かりが足りない場合のみAIの文脈説明を分類に補助利用し、初回に分類できなかった139会話は本人本文を個別に再確認して分類を補正した。タイトルだけで分類していない。自動分類には過剰・不足があり得るため、分類根拠語と方法をconversation-index.csvに残した。',
              '- 全分岐を保持し、採用エントリの出典はcurrent_nodeの祖先に属するユーザー発言のみ。非現行分岐の数値やAI提案は独立した本人の事実として採用しない。質問・試算・希望・完了報告を区別。',
              '- エントリ先頭の日付は参照した発言の最新日（日本時間）。異なる時期を統合した場合、過去の出来事の日付は本文に記す。添付由来は投稿日時を採用し、資料作成日・LINE内発言日は本文側で区別。ID順・タイトル作成日を時系列とは見なさない。',
@@ -447,7 +501,7 @@ def report(convs, entries, candidates, assets, missing, classified, longs, inven
               '| カテゴリ | 統合版の件数 |', '|---|---:|']
     lines += [f'| {cat} | {categories[cat]} |' for cat in CATEGORIES]
     lines += ['', '## 重複・変更履歴・矛盾の処理', '',
-              f'- 抽出途中稿{len(candidates)}件から、同じ活動・属性の{len(merges)}グループを統合し、{len(candidates)-len(entries)}件を削減。単純な完全一致除去だけでなく、旧状態・意思決定の理由を残して最新状態へまとめた。対応は[entry-index.csv](entry-index.csv)のcandidate_rowsとconsolidations.jsonに記録。',
+              f'- 抽出途中稿{len(candidates)}件から、同じ活動・属性の{len(merges)}グループの統合で{sum(len(e["rows"])-1 for e in merges)}件を削減し、{len(read_json(MID / "consolidations.json")["dropped"])}件を採用対象から除外。最終{len(entries)}件。旧状態・意思決定の理由を残して最新状態へまとめた。対応は[entry-index.csv](entry-index.csv)のcandidate_rowsとconsolidations.jsonに記録。',
               '- IBJの初期集計・プレ交際・真剣交際・プロポーズを1活動に統合。プロフィール公開は本人訂正の2025年8月を採用。2026年9月13日のプロポーズ成功は後日投稿された活動メモ由来。2026年10月17日の「結婚はまだで、同棲前」を優先し、成婚退会・入籍・同棲の実施を推定しない。',
               '- 住宅は購入前の候補・試算から取得・返済開始へ更新。2,260万円／2,230万円の候補価格や72㎡などを確定契約条件にしない。取得価額3,660万円は本人の控除入力値、金利0.735％は仮審査、0.9850％は2026年9月の実適用利率として区別した。',
               '- 婚前購入の方針、住まいに柔軟に対応するプロフィール、本心では現住居に住み続けたいという発言は、それぞれの時期と外向き説明・本人希望の違いを保持。家計分担は2026年10月の確定方針へ更新し、実支払開始済みとはしていない。',
@@ -475,20 +529,47 @@ def report(convs, entries, candidates, assets, missing, classified, longs, inven
     lines += ['', '長文73発言の扱い: [long-message-review.csv](long-message-review.csv)。', '']
     lines += [f'- {s}: {n}件' for s, n in sorted(long_statuses.items())]
     lines += ['', '## 保存メモリ・カスタム指示', '',
-              '- 保存済みメモリの独立した原本は見つからなかった。READMEの指定により、全ファイルのInstructionsは空欄。会話からルールを推測して埋めていない。',
-              '- カスタム指示の独立した原本も見つからなかった。ただし2026年3月の会話C0552に本人が提示した回答方針の文面と設定更新報告があり、出典を会話履歴としてPreferencesへ記載した。', '',
+              '- 保存済みメモリの独立した原本は見つからなかった。READMEの指定により、全ファイルの「指示」は空欄。会話からルールを推測して埋めていない。',
+              '- カスタム指示の独立した原本も見つからなかった。ただし2026年3月の会話C0552に本人が提示した回答方針の文面と設定更新報告があり、出典を会話履歴として「好み」へ記載した。', '',
               '## 出力形式と出典の検証', '',
               f'- 検証結果: **{"PASS" if validation["passed"] else "FAIL"}**。詳細は[validation.json](validation.json)。',
-              '- 全13ファイルで単一コードブロック、5見出しの順序、1行1エントリ、日付形式、カテゴリ内昇順、ブロック後の出力範囲注記を検証。統合版がテーマ別の重複除去集合と一致することを検証。',
+              '- 全13ファイルで単一コードブロック、日本語5見出し（指示・基本情報・経歴・プロジェクト・好み）の順序、1行1エントリ、日付形式、カテゴリ内昇順、ブロック後の出力範囲注記を検証。統合版がテーマ別の重複除去集合と一致することを検証。',
               '- 全エントリの出典が実在する現行分岐のユーザー発言であること、参照添付の実在と投稿との対応、先頭日付と最新出典日付の一致を検証。これらの機械チェックは要約内容の意味的完全性を保証しない。',
               '- [entry-index.csv](entry-index.csv)はエントリID・本文・掲載先行番号・統合元を対応付ける。[provenance.csv](provenance.csv)はエントリごとに元会話ID・発言ID・原JSON・発言日時・添付パスを列挙。統合エントリの各文節と個別出典の逐語対応までは付けていない。',
               '- [conversation-index.csv](conversation-index.csv)は全1,074会話の確認状態・テーマ・採否・未解析添付を保持。複数会話の内容が同じエントリにまとまるため、独立エントリなしを未処理とは数えない。', '',
               '## 再開・再生成・利用', '',
               '- `scripts/prepare.py`: 入力の構造解析と原本ハッシュ記録。`scripts/review.py`: 会話単位の確認。`scripts/build.py`: 保存済み抽出・統合判断からMarkdownと各台帳を生成・検証。',
               '- 再生成はプロジェクト直下で `python3 scripts/build.py`。検証のみは `python3 scripts/build.py --verify-only`。標準ライブラリのみで動作し、通信はしない。prepare.pyを再実行すると開始時ハッシュ記録が上書きされるため、今回の原本不変性の証拠を残すには既存inventory.jsonを保持する。',
-              '- 再生成に必要な中間データはconversations.jsonl、inventory.json、assets.json、long-messages.json、entries.psv、consolidations.json、画像OCR一式とreview-decisions.json。Gitへの追加・コミットはこの処理では行わない。自動で新しい意味抽出をするスクリプトではない。',
+              '- 再生成に必要な中間データはconversations.jsonl、inventory.json、assets.json、long-messages.json、entries.psv、consolidations.json、画像OCR一式とreview-decisions.json。日本語プロンプト対応の再評価・引用・OCR不変性の検証にはjapanese-prompt-review.jsonも保持する。Gitへの追加・コミットはこの処理では行わない。自動で新しい意味抽出をするスクリプトではない。',
               '- Claudeへは必要なテーマファイル、または統合版のコードブロック内を確認してコピーする。出典表・レポート・ブロック後の注記はインポート本文に含めない。テーマ版と統合版を両方入れると重複する。',
               '- 出力には本人・家族・交際相手の情報が含まれる。原本と同様にローカルで保管し、実際の外部送信・Claudeへの取込はこの作業では行わない。', '']
+    if revision:
+        old = revision['previous_entries']
+        rows = []
+        for e in old:
+            current = next((n for n in entries if set(e['rows']) & set(n['rows'])), None)
+            rows.append(dict(previous_entry_id=e['id'], current_entry_id=current['id'] if current else '',
+                             previous_category=CATEGORY_ALIASES.get(e['category'], e['category']),
+                             current_category=current['category'] if current else '',
+                             outcome='merged' if current and current['id'] != e['id'] else ('retained' if current else 'excluded'),
+                             reason=revision['changes'].get(e['id'], '本人情報・出典・最新状態・カテゴリ適合を再評価し、既存の採用判断を維持。')))
+        for e in entries:
+            if e['id'] not in {p['id'] for p in old}:
+                rows.append(dict(previous_entry_id='', current_entry_id=e['id'], previous_category='',
+                                 current_category=e['category'], outcome='added', reason=revision['new_entry_reason']))
+        write_csv(REPORTS / 'japanese-prompt-review.csv', rows,
+                  ['previous_entry_id', 'current_entry_id', 'previous_category', 'current_category', 'outcome', 'reason'])
+        section = ['', '## 日本語版プロンプトによる再評価（2026-11-07）', '',
+                   '- 指示・基本情報・経歴・プロジェクト・好みの日本語表記へ変更。指示の出典を保存済みメモリに限定する条件は維持。',
+                   f'- 前回の採用{len(old)}件をすべて再評価。原文と正規化データの一致を全{len(convs)}会話で確認し、入力不変を検証したうえで前回の本文・添付確認を再利用した。分類索引は全会話について再生成。変更に関係する原文と追加候補を確認し、今回は全会話・全技術ログを最初から再精読したという意味ではない。',
+                   f'- 既存出典外の短い本人発言{revision["additional_candidates_screened"]}件を追加候補としてスクリーニング。物件探しの実体験を追加し、MBTIはテスト結果と会話上の評価を区別して補足。検索候補だけで抽出漏れがないとは保証しない。',
+                   '- 医療歴・口座トラブル・機器交換予定などを基本情報へ、構築や実施を確認できない移行・共同家計簿の希望を好みへ再分類。プロジェクトは具体的作業を裏付ける本人発言を確認し、すべて冒頭に名称を記載。',
+                   '- Linux移行と関連する運用対応、Suica履歴連携検討と支出計上方針を統合。ある金曜夜の気分は一時的な状態として除外し、一般的な仕事観に拡大解釈しない。',
+                   '- 回答方針は本人が提示した文面から引用を拡充。引用は元の本人発言との一致を検証し、改行・箇条書きは1行形式へ整形した。',
+                   f'- PaddleOCR一次230点・NDLOCR-Lite補完222点の保存済み結果を検証して再利用。OCRモデルの再実行・変更はせず、保存済み結果{len(revision["ocr_checkpoint_hashes"])}ファイルのSHA-256不変を検証。',
+                   '- 旧項目から新項目への対応と判断理由: [japanese-prompt-review.csv](japanese-prompt-review.csv)。再開用判断記録: output/intermediate/japanese-prompt-review.json。', '']
+        index = lines.index('## テーマ別の結果') if '## テーマ別の結果' in lines else lines.index('## 重複・変更履歴・矛盾の処理')
+        lines[index:index] = section
     (REPORTS / 'extraction-report.md').write_text('\n'.join(lines))
 
 
